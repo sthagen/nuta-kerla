@@ -1,11 +1,11 @@
 use crate::{
-    arch::{SpinLock, TICK_HZ},
     ctypes::*,
     prelude::*,
-    process::{self, current_process_arc, Process, ProcessState},
+    process::{self, current_process, Process, ProcessState},
 };
 use core::sync::atomic::{AtomicUsize, Ordering};
-use process::{current_process, switch};
+use kerla_runtime::{arch::TICK_HZ, spinlock::SpinLock};
+use process::switch;
 
 const PREEMPT_PER_TICKS: usize = 30;
 static MONOTONIC_TICKS: AtomicUsize = AtomicUsize::new(0);
@@ -15,14 +15,14 @@ static TIMERS: SpinLock<Vec<Timer>> = SpinLock::new(Vec::new());
 
 struct Timer {
     current: usize,
-    process: Arc<SpinLock<Process>>,
+    process: Arc<Process>,
 }
 
 /// Suspends the current process at least `ms` milliseconds.
 pub fn _sleep_ms(ms: usize) {
     TIMERS.lock().push(Timer {
         current: ms * TICK_HZ / 1000,
-        process: current_process_arc().clone(),
+        process: current_process().clone(),
     });
 
     current_process().set_state(ProcessState::BlockedSignalable);
@@ -109,7 +109,7 @@ pub fn handle_timer_irq() {
 
         timers.retain(|timer| {
             if timer.current == 0 {
-                timer.process.lock().resume();
+                timer.process.resume();
             }
 
             timer.current > 0

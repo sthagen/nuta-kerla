@@ -1,5 +1,6 @@
-use crate::{arch::UserVAddr, fs::opened_file::Fd, result::Result};
+use crate::{fs::opened_file::Fd, result::Result};
 use crate::{net::socket::write_sockaddr, process::current_process, syscalls::SyscallHandler};
+use kerla_runtime::address::UserVAddr;
 
 impl<'a> SyscallHandler<'a> {
     pub fn sys_getpeername(
@@ -12,7 +13,6 @@ impl<'a> SyscallHandler<'a> {
             .opened_files()
             .lock()
             .get(fd)?
-            .lock()
             .getpeername()?;
 
         write_sockaddr(&endpoint, Some(sockaddr), Some(socklen))?;

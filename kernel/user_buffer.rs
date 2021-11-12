@@ -1,7 +1,7 @@
 //! User pointers.
-use crate::arch::UserVAddr;
 use crate::prelude::*;
 use core::{cmp::min, mem::size_of, slice};
+use kerla_runtime::address::UserVAddr;
 use kerla_utils::alignment::align_up;
 
 /// Parses a bitflags field given from the user. Returns `Result<T>`.
@@ -29,14 +29,12 @@ enum Inner<'a> {
 #[derive(Debug, Clone)]
 pub struct UserBuffer<'a> {
     inner: Inner<'a>,
-    pos: usize,
 }
 
 impl<'a> UserBuffer<'a> {
     pub fn from_uaddr(uaddr: UserVAddr, len: usize) -> UserBuffer<'static> {
         UserBuffer {
             inner: Inner::User { base: uaddr, len },
-            pos: 0,
         }
     }
 
@@ -52,7 +50,6 @@ impl<'a> From<&'a [u8]> for UserBuffer<'a> {
     fn from(slice: &'a [u8]) -> UserBuffer<'a> {
         UserBuffer {
             inner: Inner::Slice(slice),
-            pos: 0,
         }
     }
 }
@@ -318,7 +315,7 @@ impl UserCStr {
     }
 
     pub fn as_bytes(&self) -> &[u8] {
-        &self.string.as_bytes()
+        self.string.as_bytes()
     }
 
     pub fn as_str(&self) -> &str {

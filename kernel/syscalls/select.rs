@@ -1,7 +1,7 @@
+use kerla_runtime::address::UserVAddr;
 use kerla_utils::alignment::align_up;
 
 use crate::{
-    arch::UserVAddr,
     ctypes::c_int,
     fs::{inode::PollStatus, opened_file::Fd},
     poll::POLL_WAIT_QUEUE,
@@ -28,12 +28,7 @@ where
         for bit_i in 0..8 {
             let fd = Fd::new((byte_i * 8 + bit_i) as c_int);
             if *byte & (1 << bit_i) != 0 && fd.as_int() <= max_fd {
-                let status = current_process()
-                    .opened_files()
-                    .lock()
-                    .get(fd)?
-                    .lock()
-                    .poll()?;
+                let status = current_process().opened_files().lock().get(fd)?.poll()?;
 
                 if is_ready(status) {
                     ready_fds += 1;

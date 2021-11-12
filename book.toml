@@ -1,9 +1,0 @@
-#
-#  mdBook (https://github.com/rust-lang/mdBook)
-#
-[book]
-authors = ["Seiya Nuta"]
-language = "en"
-multilingual = false
-src = "Documentation"
-title = "Kerla Documentation"

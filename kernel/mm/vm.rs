@@ -1,13 +1,14 @@
+use crate::fs::inode::FileLike;
 use crate::{
-    arch::PageTable, arch::UserVAddr, arch::PAGE_SIZE, arch::USER_VALLOC_BASE,
-    arch::USER_VALLOC_END, fs::inode::FileLike,
-};
-use crate::{
-    arch::USER_STACK_TOP,
+    arch::{USER_STACK_TOP, USER_VALLOC_BASE, USER_VALLOC_END},
     result::{Errno, Result},
 };
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use kerla_runtime::{
+    address::UserVAddr,
+    arch::{PageTable, PAGE_SIZE},
+};
 use kerla_utils::alignment::{align_up, is_aligned};
 
 #[derive(Clone)]
@@ -116,9 +117,7 @@ impl Vm {
         len: usize,
         area_type: VmAreaType,
     ) -> Result<()> {
-        if start.access_ok(len).is_err() {
-            return Err(Errno::EINVAL.into());
-        }
+        start.access_ok(len)?;
 
         if !self.is_free_vaddr_range(start, len) {
             return Err(Errno::EINVAL.into());

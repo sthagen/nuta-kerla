@@ -1,7 +1,8 @@
 use core::mem::size_of;
 
+use kerla_runtime::address::UserVAddr;
+
 use crate::{
-    arch::UserVAddr,
     ctypes::{c_int, c_nfds, c_short},
     fs::{inode::PollStatus, opened_file::Fd},
     poll::POLL_WAIT_QUEUE,
@@ -33,12 +34,7 @@ impl<'a> SyscallHandler<'a> {
                 let revents = if fd.as_int() < 0 || events.is_empty() {
                     0
                 } else {
-                    let status = current_process()
-                        .opened_files()
-                        .lock()
-                        .get(fd)?
-                        .lock()
-                        .poll()?;
+                    let status = current_process().opened_files().lock().get(fd)?.poll()?;
 
                     let revents = events & status;
                     if !revents.is_empty() {

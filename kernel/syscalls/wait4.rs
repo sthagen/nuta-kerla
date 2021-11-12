@@ -1,5 +1,4 @@
 use crate::{
-    arch::UserVAddr,
     ctypes::*,
     prelude::*,
     process::{current_process, PId, ProcessState, JOIN_WAIT_QUEUE},
@@ -7,6 +6,7 @@ use crate::{
 };
 
 use bitflags::bitflags;
+use kerla_runtime::address::UserVAddr;
 
 bitflags! {
     pub struct WaitOptions: c_int {
@@ -26,7 +26,6 @@ impl<'a> SyscallHandler<'a> {
         let (got_pid, status_value) = JOIN_WAIT_QUEUE.sleep_signalable_until(|| {
             let current = current_process();
             for child in current.children().iter() {
-                let child = child.lock();
                 if pid.as_i32() > 0 && child.pid() != pid {
                     // Wait for the specific PID.
                     continue;
@@ -50,9 +49,7 @@ impl<'a> SyscallHandler<'a> {
         })?;
 
         // Evict the joined processs object.
-        current_process()
-            .children_mut()
-            .retain(|p| p.lock().pid() != got_pid);
+        current_process().children().retain(|p| p.pid() != got_pid);
 
         if let Some(status) = status {
             // FIXME: This is NOT the correct format of `status`.

@@ -1,10 +1,7 @@
-use crate::{
-    arch::{self, VAddr},
-    result::{Errno, Error, Result},
-};
+use crate::result::{Errno, Error, Result};
 
 use alloc::vec::Vec;
-use arch::UserVAddr;
+use kerla_runtime::address::{UserVAddr, VAddr};
 
 use core::mem::size_of;
 
@@ -46,6 +43,7 @@ fn push_usize_to_stack(sp: &mut VAddr, stack_bottom: VAddr, value: usize) -> Res
 }
 
 fn push_aux_data_to_stack(sp: &mut VAddr, stack_bottom: VAddr, auxv: &Auxv) -> Result<()> {
+    #[allow(clippy::single_match)]
     match auxv {
         Auxv::Random(values) => push_bytes_to_stack(sp, stack_bottom, values.as_slice())?,
         _ => {}

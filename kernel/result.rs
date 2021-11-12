@@ -1,8 +1,17 @@
 use core::fmt;
 
+use kerla_runtime::{
+    address::{AccessError, NullUserPointerError},
+    page_allocator::PageAllocError,
+};
+
+#[cfg(debug_assertions)]
+use kerla_runtime::backtrace::CapturedBacktrace;
+
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 #[repr(i32)]
 #[allow(unused)]
+#[allow(clippy::upper_case_acronyms)]
 pub enum Errno {
     EPERM = 1,
     ENOENT = 2,
@@ -63,6 +72,8 @@ enum ErrorMessage {
 pub struct Error {
     errno: Errno,
     message: Option<ErrorMessage>,
+    #[cfg(debug_assertions)]
+    backtrace: Option<CapturedBacktrace>,
 }
 
 impl Error {
@@ -70,13 +81,26 @@ impl Error {
         Error {
             errno,
             message: None,
+            #[cfg(debug_assertions)]
+            backtrace: Some(CapturedBacktrace::capture()),
         }
     }
 
-    pub const fn with_message(errno: Errno, message: &'static str) -> Error {
+    pub fn with_message(errno: Errno, message: &'static str) -> Error {
         Error {
             errno,
             message: Some(ErrorMessage::StaticStr(message)),
+            #[cfg(debug_assertions)]
+            backtrace: Some(CapturedBacktrace::capture()),
+        }
+    }
+
+    pub const fn with_message_const(errno: Errno, message: &'static str) -> Error {
+        Error {
+            errno,
+            message: Some(ErrorMessage::StaticStr(message)),
+            #[cfg(debug_assertions)]
+            backtrace: None,
         }
     }
 
@@ -86,6 +110,7 @@ impl Error {
 }
 
 impl fmt::Debug for Error {
+    #[cfg(not(debug_assertions))]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if let Some(message) = self.message.as_ref() {
             match message {
@@ -93,6 +118,33 @@ impl fmt::Debug for Error {
                     write!(f, "[{:?}] {}", self.errno, message)
                 }
             }
+        } else {
+            write!(f, "{:?}", self.errno)
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(message) = self.message.as_ref() {
+            match message {
+                ErrorMessage::StaticStr(message) => {
+                    if let Some(ref trace) = self.backtrace {
+                        write!(
+                            f,
+                            "[{:?}] {}\n    This error originates from:\n{:?}",
+                            self.errno, message, trace
+                        )
+                    } else {
+                        write!(f, "[{:?}] {}", self.errno, message)
+                    }
+                }
+            }
+        } else if let Some(ref trace) = self.backtrace {
+            write!(
+                f,
+                "{:?}: This error originates from:\n{:?}",
+                self.errno, trace
+            )
         } else {
             write!(f, "{:?}", self.errno)
         }
@@ -105,9 +157,26 @@ impl From<Errno> for Error {
     }
 }
 
+impl From<AccessError> for Error {
+    fn from(_error: AccessError) -> Error {
+        Error::new(Errno::EFAULT)
+    }
+}
+
+impl From<PageAllocError> for Error {
+    fn from(_error: PageAllocError) -> Error {
+        Error::new(Errno::ENOMEM)
+    }
+}
+
+impl From<NullUserPointerError> for Error {
+    fn from(_error: NullUserPointerError) -> Error {
+        Error::new(Errno::EFAULT)
+    }
+}
+
 impl From<smoltcp::Error> for Error {
     fn from(error: smoltcp::Error) -> Error {
-        debug_warn!("smoltcp: {}", error);
         match error {
             smoltcp::Error::Exhausted => Error::with_message(Errno::EINVAL, "smoltcp(Exhausted)"),
             smoltcp::Error::Illegal => Error::with_message(Errno::EINVAL, "smoltcp(Illegal)"),

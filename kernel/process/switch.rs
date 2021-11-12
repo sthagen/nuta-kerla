@@ -1,32 +1,20 @@
 use super::*;
 use crate::process::PId;
 use crate::{
-    arch::{self, enable_interrupt, is_interrupt_enabled},
+    arch::{self},
     process::process::PROCESSES,
 };
 
 use alloc::sync::Arc;
 
-use arrayvec::ArrayVec;
-
 use core::mem::{self};
-
-cpu_local! {
-    static ref HELD_LOCKS: ArrayVec<Arc<SpinLock<Process>>, 2> = ArrayVec::new_const();
-}
 
 /// Yields execution to another thread.
 pub fn switch() {
-    // Save the current interrupt enable flag to restore it in the next execution
-    // of the currently running thread.
-    let interrupt_enabled = is_interrupt_enabled();
-
-    let prev_proc = current_process_arc().clone();
-    let (prev_pid, prev_state) = {
-        let prev = prev_proc.lock();
-        (prev.pid(), prev.state)
-    };
-    let next_proc = {
+    let prev = current_process().clone();
+    let prev_pid = prev.pid();
+    let prev_state = prev.state();
+    let next = {
         let scheduler = SCHEDULER.lock();
 
         // Push back the currently running thread to the runqueue if it's still
@@ -42,67 +30,41 @@ pub fn switch() {
         }
     };
 
-    if Arc::ptr_eq(&prev_proc, &next_proc) {
+    if Arc::ptr_eq(&prev, &next) {
         // Continue executing the current process.
         return;
     }
 
-    let mut prev = prev_proc.lock();
-    let mut next = next_proc.lock();
     debug_assert!(next.state() == ProcessState::Runnable);
 
-    // Save locks that will be released later.
-    debug_assert!(HELD_LOCKS.get().is_empty());
-    HELD_LOCKS.as_mut().push(prev_proc.clone());
-    HELD_LOCKS.as_mut().push(next_proc.clone());
-
-    if let Some(vm) = next.vm.as_ref() {
+    if let Some(vm) = next.vm().clone() {
         let lock = vm.lock();
         lock.page_table().switch();
     }
 
-    // Drop `next_thread` here because `switch_thread` won't return when the current
-    // process is being destroyed (e.g. by exit(2)) and it leads to a memory leak.
+    // Drop `prev` and `next` here because `switch_thread` won't return when the
+    // current process is being destroyed (e.g. by exit(2)).
+    //
+    // Since processes are referenced from at least the following two places,
+    // we can safely decrement reference counts without immediately drop here:
+    //
+    // - prev or next: they holds Arc<Process> (not &Arc<Process>).
+    // - Their parent processes's list of children.
     //
     // To cheat the borrow checker we do so by `Arc::decrement_strong_count`.
-    debug_assert!(Arc::strong_count(&next_proc) > 1);
+    debug_assert!(Arc::strong_count(&prev) > 1);
+    debug_assert!(Arc::strong_count(&next) > 1);
     unsafe {
-        Arc::decrement_strong_count(Arc::as_ptr(&prev_proc));
-        Arc::decrement_strong_count(Arc::as_ptr(&next_proc));
+        Arc::decrement_strong_count(Arc::as_ptr(&prev));
+        Arc::decrement_strong_count(Arc::as_ptr(&next));
     }
 
     // Switch into the next thread.
-    CURRENT.as_mut().set(next_proc.clone());
-    arch::switch_thread(&mut prev.arch, &mut next.arch);
-
-    // Don't call destructors: we'll unlock these locks in `after_switch` in the
-    // next thread's context because these lock guards won't be dropped until the
-    // current (prev) thread is resumed next time.
-    mem::forget(prev);
-    mem::forget(next);
+    CURRENT.as_mut().set(next.clone());
+    arch::switch_thread(prev.arch(), next.arch());
 
     // Don't call destructors as we've already decremented (dropped) the
     // reference count by `Arc::decrement_strong_count` above.
-    mem::forget(prev_proc);
-    mem::forget(next_proc);
-
-    // Now we're in the next thread. Release held locks and continue executing.
-    after_switch();
-
-    // Retstore the interrupt enable flag manually because lock guards
-    // (`prev` and `next`) that holds the flag state are `mem::forget`-ed.
-    if interrupt_enabled {
-        unsafe {
-            enable_interrupt();
-        }
-    }
-}
-
-#[no_mangle]
-pub extern "C" fn after_switch() {
-    for proc in HELD_LOCKS.as_mut().drain(..) {
-        unsafe {
-            proc.force_unlock();
-        }
-    }
+    mem::forget(prev);
+    mem::forget(next);
 }

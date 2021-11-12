@@ -1,8 +1,9 @@
 use super::{IoVec, IOV_MAX, MAX_READ_WRITE_LEN};
 use crate::prelude::*;
-use crate::{arch::UserVAddr, fs::opened_file::Fd, user_buffer::UserBuffer};
+use crate::{fs::opened_file::Fd, user_buffer::UserBuffer};
 use crate::{process::current_process, syscalls::SyscallHandler};
 use core::cmp::min;
+use kerla_runtime::address::UserVAddr;
 
 use core::mem::size_of;
 
@@ -31,9 +32,7 @@ impl<'a> SyscallHandler<'a> {
                 continue;
             }
 
-            total_len += opened_file
-                .lock()
-                .write(UserBuffer::from_uaddr(iov.base, iov.len))?;
+            total_len += opened_file.write(UserBuffer::from_uaddr(iov.base, iov.len))?;
         }
 
         // MAX_READ_WRITE_LEN limit guarantees total_len is in the range of isize.

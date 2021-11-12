@@ -1,5 +1,7 @@
+use arrayvec::ArrayString;
+use core::fmt;
+
 use crate::{
-    arch::{print_str, SpinLock, UserVAddr},
     ctypes::*,
     fs::{
         inode::{FileLike, INodeNo},
@@ -13,14 +15,19 @@ use crate::{
     user_buffer::UserBuffer,
     user_buffer::{UserBufReader, UserBufferMut},
 };
+use kerla_runtime::{address::UserVAddr, print::print_bytes, spinlock::SpinLock};
 
 pub struct Tty {
+    name: ArrayString<8>,
     discipline: LineDiscipline,
 }
 
 impl Tty {
-    pub fn new() -> Tty {
+    pub fn new(name: &str) -> Tty {
+        let mut name_buf = ArrayString::new();
+        let _ = name_buf.try_push_str(name);
         Tty {
+            name: name_buf,
             discipline: LineDiscipline::new(),
         }
     }
@@ -31,7 +38,7 @@ impl Tty {
                 match ctrl {
                     LineControl::Backspace => {
                         // Remove the previous character by overwriting with a whitespace.
-                        print_str(b"\x08 \x08");
+                        print_bytes(b"\x08 \x08");
                     }
                     LineControl::Echo(ch) => {
                         self.write(0, [ch].as_slice().into(), &OpenOptions::readwrite())
@@ -50,6 +57,12 @@ impl Tty {
 const TIOCGPGRP: usize = 0x540f;
 const TIOCSPGRP: usize = 0x5410;
 const TIOCGWINSZ: usize = 0x5413;
+
+impl fmt::Debug for Tty {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Tty").field("name", &self.name).finish()
+    }
+}
 
 impl FileLike for Tty {
     fn ioctl(&self, cmd: usize, arg: usize) -> Result<isize> {
@@ -100,16 +113,16 @@ impl FileLike for Tty {
     }
 
     fn write(&self, _offset: usize, buf: UserBuffer<'_>, _options: &OpenOptions) -> Result<usize> {
-        print_str(b"\x1b[1m");
+        print_bytes(b"\x1b[1m");
         let mut tmp = [0; 32];
         let mut total_len = 0;
         let mut reader = UserBufReader::from(buf);
         while reader.remaining_len() > 0 {
             let copied_len = reader.read_bytes(&mut tmp)?;
-            print_str(&tmp.as_slice()[..copied_len]);
+            print_bytes(&tmp.as_slice()[..copied_len]);
             total_len += copied_len;
         }
-        print_str(b"\x1b[0m");
+        print_bytes(b"\x1b[0m");
         Ok(total_len)
     }
 }

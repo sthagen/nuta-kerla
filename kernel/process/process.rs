@@ -1,38 +1,44 @@
-use super::{
-    elf::{Elf, ProgramHeader},
-    process_group::{PgId, ProcessGroup},
-    signal::{Signal, SignalDelivery, SIGKILL},
-    *,
-};
-
 use crate::{
-    arch::{self, SpinLock, SyscallFrame},
-    boot::INITIAL_ROOT_FS,
+    arch::{self, KERNEL_STACK_SIZE, USER_STACK_TOP},
     ctypes::*,
-    fs::devfs::SERIAL_TTY,
     fs::{
+        devfs::SERIAL_TTY,
         mount::RootFs,
-        opened_file::{OpenOptions, OpenedFileTable},
+        opened_file::{Fd, OpenFlags, OpenOptions, OpenedFile, OpenedFileTable, PathComponent},
         path::Path,
     },
-    mm::page_allocator::{alloc_pages, AllocPageFlags},
     mm::vm::{Vm, VmAreaType},
     prelude::*,
     process::{
+        cmdline::Cmdline,
+        current_process,
+        elf::{Elf, ProgramHeader},
         init_stack::{estimate_user_init_stack_size, init_user_stack, Auxv},
-        signal::SIGCHLD,
+        process_group::{PgId, ProcessGroup},
+        signal::{SigAction, Signal, SignalDelivery, SIGCHLD, SIGKILL},
+        switch, UserVAddr, JOIN_WAIT_QUEUE, SCHEDULER,
     },
     random::read_secure_random,
+    INITIAL_ROOT_FS,
 };
 
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use arch::SpinLockGuard;
+use atomic_refcell::{AtomicRef, AtomicRefCell};
+use core::cmp::max;
+use core::mem::size_of;
 use core::sync::atomic::{AtomicI32, Ordering};
+use crossbeam::atomic::AtomicCell;
 use goblin::elf64::program_header::PT_LOAD;
+use kerla_runtime::{
+    arch::{SyscallFrame, PAGE_SIZE},
+    page_allocator::{alloc_pages, AllocPageFlags},
+    spinlock::{SpinLock, SpinLockGuard},
+};
+use kerla_utils::alignment::align_up;
 
-type ProcessTable = BTreeMap<PId, Arc<SpinLock<Process>>>;
+type ProcessTable = BTreeMap<PId, Arc<Process>>;
 
 /// The process table. All processes are registered in with its process Id.
 pub(super) static PROCESSES: SpinLock<ProcessTable> = SpinLock::new(BTreeMap::new());
@@ -86,60 +92,41 @@ pub enum ProcessState {
 
 /// The process control block.
 pub struct Process {
-    pub arch: arch::Thread,
-    pub(super) process_group: Weak<SpinLock<ProcessGroup>>,
-    pub(super) pid: PId,
-    pub(super) state: ProcessState,
-    pub(super) parent: Option<Weak<SpinLock<Process>>>,
-    pub(super) children: Vec<Arc<SpinLock<Process>>>,
-    pub(super) vm: Option<Arc<SpinLock<Vm>>>,
-    pub(super) opened_files: Arc<SpinLock<OpenedFileTable>>,
-    pub(super) root_fs: Arc<SpinLock<RootFs>>,
-    pub(super) signals: SignalDelivery,
-    pub(super) signaled_frame: Option<SyscallFrame>,
+    arch: arch::Process,
+    process_group: AtomicRefCell<Weak<SpinLock<ProcessGroup>>>,
+    pid: PId,
+    state: AtomicCell<ProcessState>,
+    parent: Weak<Process>,
+    cmdline: AtomicRefCell<Cmdline>,
+    children: SpinLock<Vec<Arc<Process>>>,
+    vm: AtomicRefCell<Option<Arc<SpinLock<Vm>>>>,
+    opened_files: SpinLock<OpenedFileTable>,
+    root_fs: Arc<SpinLock<RootFs>>,
+    signals: SpinLock<SignalDelivery>,
+    signaled_frame: AtomicCell<Option<SyscallFrame>>,
 }
 
 impl Process {
-    /*
-    /// Creates a kernel thread. Currently it's not used.
-    pub fn new_kthread(ip: VAddr) -> Result<Arc<SpinLock<Process>>> {
-        let stack_bottom = alloc_pages(KERNEL_STACK_SIZE / PAGE_SIZE, AllocPageFlags::KERNEL)
-            .into_error_with_message(Errno::ENOMEM, "failed to allocate kernel stack")?;
-        let sp = stack_bottom.as_vaddr().add(KERNEL_STACK_SIZE);
-        let process = Arc::new(Process {
-            inner: SpinLock::new(MutableFields {
-                arch: arch::Thread::new_kthread(ip, sp),
-                state: ProcessState::Runnable,
-            }),
-            vm: None,
-            pid: alloc_pid().into_error_with_message(Errno::EAGAIN, "failed to allocate PID")?,
-            opened_files: Arc::new(SpinLock::new(OpenedFileTable::new())),
-        });
-
-        SCHEDULER.lock().enqueue(process.clone());
-        Ok(process)
-    }
-    */
-
     /// Creates a per-CPU idle thread.
     ///
     /// An idle thread is a special type of kernel threads which is executed
     /// only if there're no other runnable processes.
-    pub fn new_idle_thread() -> Result<Arc<SpinLock<Process>>> {
+    pub fn new_idle_thread() -> Result<Arc<Process>> {
         let process_group = ProcessGroup::new(PgId::new(0));
-        let proc = Arc::new(SpinLock::new(Process {
-            process_group: Arc::downgrade(&process_group),
-            arch: arch::Thread::new_idle_thread(),
-            state: ProcessState::Runnable,
-            parent: None,
-            children: Vec::new(),
-            vm: None,
+        let proc = Arc::new(Process {
+            process_group: AtomicRefCell::new(Arc::downgrade(&process_group)),
+            arch: arch::Process::new_idle_thread(),
+            state: AtomicCell::new(ProcessState::Runnable),
+            parent: Weak::new(),
+            cmdline: AtomicRefCell::new(Cmdline::new()),
+            children: SpinLock::new(Vec::new()),
+            vm: AtomicRefCell::new(None),
             pid: PId::new(0),
             root_fs: INITIAL_ROOT_FS.clone(),
-            opened_files: Arc::new(SpinLock::new(OpenedFileTable::new())),
-            signals: SignalDelivery::new(),
-            signaled_frame: None,
-        }));
+            opened_files: SpinLock::new(OpenedFileTable::new()),
+            signals: SpinLock::new(SignalDelivery::new()),
+            signaled_frame: AtomicCell::new(None),
+        });
 
         process_group.lock().add(Arc::downgrade(&proc));
         Ok(proc)
@@ -158,31 +145,27 @@ impl Process {
         // Open stdin.
         opened_files.open_with_fixed_fd(
             Fd::new(0),
-            Arc::new(SpinLock::new(OpenedFile::new(
+            Arc::new(OpenedFile::new(
                 console.clone(),
                 OpenFlags::O_RDONLY.into(),
                 0,
-            ))),
+            )),
             OpenOptions::empty(),
         )?;
         // Open stdout.
         opened_files.open_with_fixed_fd(
             Fd::new(1),
-            Arc::new(SpinLock::new(OpenedFile::new(
+            Arc::new(OpenedFile::new(
                 console.clone(),
                 OpenFlags::O_WRONLY.into(),
                 0,
-            ))),
+            )),
             OpenOptions::empty(),
         )?;
         // Open stderr.
         opened_files.open_with_fixed_fd(
             Fd::new(2),
-            Arc::new(SpinLock::new(OpenedFile::new(
-                console,
-                OpenFlags::O_WRONLY.into(),
-                0,
-            ))),
+            Arc::new(OpenedFile::new(console, OpenFlags::O_WRONLY.into(), 0)),
             OpenOptions::empty(),
         )?;
 
@@ -191,19 +174,20 @@ impl Process {
         let stack_bottom = alloc_pages(KERNEL_STACK_SIZE / PAGE_SIZE, AllocPageFlags::KERNEL)?;
         let kernel_sp = stack_bottom.as_vaddr().add(KERNEL_STACK_SIZE);
         let process_group = ProcessGroup::new(PgId::new(1));
-        let process = Arc::new(SpinLock::new(Process {
-            process_group: Arc::downgrade(&process_group),
+        let process = Arc::new(Process {
+            process_group: AtomicRefCell::new(Arc::downgrade(&process_group)),
             pid,
-            parent: None,
-            children: Vec::new(),
-            state: ProcessState::Runnable,
-            arch: arch::Thread::new_user_thread(entry.ip, entry.user_sp, kernel_sp),
-            vm: Some(Arc::new(SpinLock::new(entry.vm))),
-            opened_files: Arc::new(SpinLock::new(opened_files)),
+            parent: Weak::new(),
+            children: SpinLock::new(Vec::new()),
+            state: AtomicCell::new(ProcessState::Runnable),
+            cmdline: AtomicRefCell::new(Cmdline::from_argv(argv)),
+            arch: arch::Process::new_user_thread(entry.ip, entry.user_sp, kernel_sp),
+            vm: AtomicRefCell::new(Some(Arc::new(SpinLock::new(entry.vm)))),
+            opened_files: SpinLock::new(opened_files),
             root_fs,
-            signals: SignalDelivery::new(),
-            signaled_frame: None,
-        }));
+            signals: SpinLock::new(SignalDelivery::new()),
+            signaled_frame: AtomicCell::new(None),
+        });
 
         process_group.lock().add(Arc::downgrade(&process));
         PROCESSES.lock().insert(pid, process);
@@ -214,7 +198,7 @@ impl Process {
     }
 
     /// Returns the process with the given process ID.
-    pub fn find_by_pid(pid: PId) -> Option<Arc<SpinLock<Process>>> {
+    pub fn find_by_pid(pid: PId) -> Option<Arc<Process>> {
         PROCESSES.lock().get(&pid).cloned()
     }
 
@@ -223,14 +207,32 @@ impl Process {
         self.pid
     }
 
-    /// Its child processes.
-    pub fn children(&self) -> &[Arc<SpinLock<Process>>] {
-        &self.children
+    /// The arch-specific information.
+    pub fn arch(&self) -> &arch::Process {
+        &self.arch
+    }
+
+    /// The process parent.
+    fn parent(&self) -> Option<Arc<Process>> {
+        self.parent.upgrade().as_ref().cloned()
+    }
+
+    /// The ID of process being parent of this process.
+    pub fn ppid(&self) -> PId {
+        if let Some(parent) = self.parent() {
+            parent.pid()
+        } else {
+            PId::new(0)
+        }
+    }
+
+    pub fn cmdline(&self) -> AtomicRef<'_, Cmdline> {
+        self.cmdline.borrow()
     }
 
     /// Its child processes.
-    pub fn children_mut(&mut self) -> &mut Vec<Arc<SpinLock<Process>>> {
-        &mut self.children
+    pub fn children(&self) -> SpinLockGuard<'_, Vec<Arc<Process>>> {
+        self.children.lock()
     }
 
     /// The process's path resolution info.
@@ -239,44 +241,44 @@ impl Process {
     }
 
     /// The ppened files table.
-    pub fn opened_files(&self) -> &Arc<SpinLock<OpenedFileTable>> {
+    pub fn opened_files(&self) -> &SpinLock<OpenedFileTable> {
         &self.opened_files
     }
 
     /// The virtual memory space. It's `None` if the process is a kernel thread.
-    pub fn vm(&self) -> Option<&Arc<SpinLock<Vm>>> {
-        self.vm.as_ref()
+    pub fn vm(&self) -> AtomicRef<'_, Option<Arc<SpinLock<Vm>>>> {
+        self.vm.borrow()
     }
 
     /// Signals.
-    pub fn signals_mut(&mut self) -> &mut SignalDelivery {
-        &mut self.signals
+    pub fn signals(&self) -> &SpinLock<SignalDelivery> {
+        &self.signals
     }
 
     /// Changes the process group.
-    pub fn set_process_group(&mut self, pg: Weak<SpinLock<ProcessGroup>>) {
-        self.process_group = pg;
+    pub fn set_process_group(&self, pg: Weak<SpinLock<ProcessGroup>>) {
+        *self.process_group.borrow_mut() = pg;
     }
 
     /// The current process group.
     pub fn process_group(&self) -> Arc<SpinLock<ProcessGroup>> {
-        self.process_group.upgrade().unwrap()
+        self.process_group.borrow().upgrade().unwrap()
     }
 
-    /// The current process group as a `Weak` reference.
-    pub fn process_group_weak(&self) -> &Weak<SpinLock<ProcessGroup>> {
-        &self.process_group
+    /// Returns true if the process belongs to the process group `pg`.
+    pub fn belongs_to_process_group(&self, pg: &Weak<SpinLock<ProcessGroup>>) -> bool {
+        Weak::ptr_eq(&self.process_group.borrow(), pg)
     }
 
     /// The current process state.
     pub fn state(&self) -> ProcessState {
-        self.state
+        self.state.load()
     }
 
     /// Updates the process state.
-    pub fn set_state(&mut self, new_state: ProcessState) {
+    pub fn set_state(&self, new_state: ProcessState) {
         let scheduler = SCHEDULER.lock();
-        self.state = new_state;
+        self.state.store(new_state);
         match new_state {
             ProcessState::Runnable => {}
             ProcessState::BlockedSignalable | ProcessState::ExitedWith(_) => {
@@ -286,85 +288,79 @@ impl Process {
     }
 
     /// Resumes a process.
-    pub fn resume(&mut self) {
-        debug_assert!(!matches!(self.state, ProcessState::ExitedWith(_)));
+    pub fn resume(&self) {
+        let old_state = self.state.swap(ProcessState::Runnable);
 
-        if self.state == ProcessState::Runnable {
+        debug_assert!(!matches!(old_state, ProcessState::ExitedWith(_)));
+
+        if old_state == ProcessState::Runnable {
             return;
         }
 
-        self.set_state(ProcessState::Runnable);
         SCHEDULER.lock().enqueue(self.pid);
     }
 
     /// Searches the opned file table by the file descriptor.
-    pub fn get_opened_file_by_fd(&self, fd: Fd) -> Result<Arc<SpinLock<OpenedFile>>> {
+    pub fn get_opened_file_by_fd(&self, fd: Fd) -> Result<Arc<OpenedFile>> {
         Ok(self.opened_files.lock().get(fd)?.clone())
     }
 
-    /// Terminates the **current** process. `proc` must be the current process
-    /// lock.
-    pub fn exit(mut proc: SpinLockGuard<'_, Process>, status: c_int) -> ! {
-        if proc.pid == PId::new(1) {
+    /// Terminates the **current** process.
+    pub fn exit(status: c_int) -> ! {
+        let current = current_process();
+        if current.pid == PId::new(1) {
             panic!("init (pid=0) tried to exit")
         }
 
-        proc.set_state(ProcessState::ExitedWith(status));
-        if let Some(parent) = proc.parent.as_ref() {
-            if let Some(parent) = parent.upgrade() {
-                parent.lock().send_signal(SIGCHLD);
-            }
+        current.set_state(ProcessState::ExitedWith(status));
+        if let Some(parent) = current.parent.upgrade() {
+            parent.send_signal(SIGCHLD);
         }
 
-        PROCESSES.lock().remove(&proc.pid);
+        // Close opened files here instead of in Drop::drop because `proc` is
+        // not dropped until it's joined by the parent process. Drop them to
+        // make pipes closed.
+        current.opened_files.lock().close_all();
+
+        PROCESSES.lock().remove(&current.pid);
         JOIN_WAIT_QUEUE.wake_all();
-        drop(proc);
         switch();
         unreachable!();
     }
 
-    /// Terminates the **current** process by a signal. `proc` must be the
-    /// current process lock.
-    pub fn exit_by_signal(proc: SpinLockGuard<'_, Process>, _signal: Signal) -> ! {
-        Process::exit(
-            proc, 1, /* FIXME: how should we compute the exit status? */
-        );
+    /// Terminates the **current** process by a signal.
+    pub fn exit_by_signal(_signal: Signal) -> ! {
+        Process::exit(1 /* FIXME: how should we compute the exit status? */);
     }
 
     /// Sends a signal.
-    pub fn send_signal(&mut self, signal: Signal) {
-        self.signals.signal(signal);
+    pub fn send_signal(&self, signal: Signal) {
+        self.signals.lock().signal(signal);
         self.resume();
     }
 
     /// Returns `true` if there's a pending signal.
     pub fn has_pending_signals(&self) -> bool {
-        self.signals.is_pending()
+        self.signals.lock().is_pending()
     }
 
-    /// Tries to delivering a pending signal.
+    /// Tries to delivering a pending signal to the current process.
     ///
     /// If there's a pending signal, it may modify `frame` (e.g. user return
     /// address and stack pointer) to call the registered user's signal handler.
-    ///
-    /// **This method must be called only from the current process in the
-    /// system call handler.**
-    pub fn try_delivering_signal(
-        mut current: SpinLockGuard<'_, Process>,
-        frame: &mut SyscallFrame,
-    ) -> Result<()> {
+    pub fn try_delivering_signal(frame: &mut SyscallFrame) -> Result<()> {
         // TODO: sigmask
-
-        if let Some((signal, sigaction)) = current.signals.pop_pending() {
+        let current = current_process();
+        if let Some((signal, sigaction)) = current.signals.lock().pop_pending() {
             match sigaction {
-                signal::SigAction::Ignore => {}
-                signal::SigAction::Terminate => {
+                SigAction::Ignore => {}
+                SigAction::Terminate => {
                     trace!("terminating {:?} by {:?}", current.pid, signal,);
-                    Process::exit(current, 1 /* FIXME: */);
+                    Process::exit(1 /* FIXME: */);
                 }
-                signal::SigAction::Handler { handler } => {
+                SigAction::Handler { handler } => {
                     trace!("delivering {:?} to {:?}", signal, current.pid,);
-                    current.signaled_frame = Some(*frame);
+                    current.signaled_frame.store(Some(*frame));
                     unsafe {
                         current.arch.setup_signal_stack(frame, signal, handler)?;
                     }
@@ -377,62 +373,95 @@ impl Process {
 
     /// So-called `sigreturn`: restores the user context when the signal is
     /// delivered to a signal handler.
-    pub fn restore_signaled_user_stack(
-        mut current: SpinLockGuard<'_, Process>,
-        current_frame: &mut SyscallFrame,
-    ) {
-        if let Some(signaled_frame) = current.signaled_frame.take() {
+    pub fn restore_signaled_user_stack(current: &Arc<Process>, current_frame: &mut SyscallFrame) {
+        if let Some(signaled_frame) = current.signaled_frame.swap(None) {
             current
                 .arch
                 .setup_sigreturn_stack(current_frame, &signaled_frame);
         } else {
             // The user intentionally called sigreturn(2) while it is not signaled.
             // TODO: Should we ignore instead of the killing the process?
-            Process::exit_by_signal(current, SIGKILL);
+            Process::exit_by_signal(SIGKILL);
         }
     }
 
     /// Creates a new virtual memory space, loads the executable, and overwrites
-    /// the process.
+    /// the **current** process.
     ///
     /// It modifies `frame` to start from the new executable's entry point with
     /// new stack (ie. argv and envp) when the system call handler returns into
     /// the userspace.
-    ///
-    /// **This method must be called only from the current process in the
-    /// system call handler.**
     pub fn execve(
-        &mut self,
         frame: &mut SyscallFrame,
         executable_path: Arc<PathComponent>,
         argv: &[&[u8]],
         envp: &[&[u8]],
     ) -> Result<()> {
-        self.opened_files.lock().close_cloexec_files();
-        let entry = setup_userspace(executable_path, argv, envp, &self.root_fs)?;
+        let current = current_process();
+        current.opened_files.lock().close_cloexec_files();
+        current.cmdline.borrow_mut().set_by_argv(argv);
+
+        let entry = setup_userspace(executable_path, argv, envp, &current.root_fs)?;
 
         // FIXME: Should we prevent try_delivering_signal()?
-        self.signaled_frame = None;
+        current.signaled_frame.store(None);
 
         entry.vm.page_table().switch();
-        self.vm = Some(Arc::new(SpinLock::new(entry.vm)));
+        *current.vm.borrow_mut() = Some(Arc::new(SpinLock::new(entry.vm)));
 
-        self.arch
+        current
+            .arch
             .setup_execve_stack(frame, entry.ip, entry.user_sp)?;
+
         Ok(())
+    }
+
+    /// Creates a new process. The calling process (`self`) will be the parent
+    /// process of the created process. Returns the created child process.
+    pub fn fork(parent: &Arc<Process>, parent_frame: &SyscallFrame) -> Result<Arc<Process>> {
+        let parent_weak = Arc::downgrade(parent);
+        let mut process_table = PROCESSES.lock();
+        let pid = alloc_pid(&mut process_table)?;
+        let arch = parent.arch.fork(parent_frame)?;
+        let vm = parent.vm().as_ref().unwrap().lock().fork()?;
+        let opened_files = parent.opened_files().lock().fork();
+        let process_group = parent.process_group();
+
+        let child = Arc::new(Process {
+            process_group: AtomicRefCell::new(Arc::downgrade(&process_group)),
+            pid,
+            state: AtomicCell::new(ProcessState::Runnable),
+            parent: parent_weak,
+            cmdline: AtomicRefCell::new(parent.cmdline().clone()),
+            children: SpinLock::new(Vec::new()),
+            vm: AtomicRefCell::new(Some(Arc::new(SpinLock::new(vm)))),
+            opened_files: SpinLock::new(opened_files),
+            root_fs: parent.root_fs().clone(),
+            arch,
+            signals: SpinLock::new(SignalDelivery::new()),
+            signaled_frame: AtomicCell::new(None),
+        });
+
+        process_group.lock().add(Arc::downgrade(&child));
+        parent.children().push(child.clone());
+        process_table.insert(pid, child.clone());
+        SCHEDULER.lock().enqueue(pid);
+        Ok(child)
     }
 }
 
 impl Drop for Process {
     fn drop(&mut self) {
+        trace!(
+            "dropping {:?} (cmdline={})",
+            self.pid(),
+            self.cmdline().as_str()
+        );
+
         // Since the process's reference count has already reached to zero (that's
         // why the process is being dropped), ProcessGroup::remove_dropped_processes
         // should remove this process from its list.
-        self.process_group
-            .upgrade()
-            .unwrap()
-            .lock()
-            .remove_dropped_processes();
+        self.process_group().lock().remove_dropped_processes();
     }
 }
 
@@ -489,7 +518,7 @@ fn do_setup_userspace(
         return do_setup_userspace(shebang_path, &argv, envp, root_fs, false);
     }
 
-    let elf = Elf::parse(&buf)?;
+    let elf = Elf::parse(buf)?;
     let ip = elf.entry()?;
 
     let mut end_of_image = 0;
@@ -534,8 +563,8 @@ fn do_setup_userspace(
     )?;
 
     let mut vm = Vm::new(
-        UserVAddr::new_nonnull(user_stack_bottom).unwrap(),
-        UserVAddr::new_nonnull(user_heap_bottom).unwrap(),
+        UserVAddr::new(user_stack_bottom).unwrap(),
+        UserVAddr::new(user_heap_bottom).unwrap(),
     )?;
     for i in 0..(file_header_len / PAGE_SIZE) {
         vm.page_table_mut().map_user_page(

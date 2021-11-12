@@ -1,5 +1,6 @@
+use kerla_runtime::address::UserVAddr;
+
 use crate::{
-    arch::UserVAddr,
     fs::opened_file::{Fd, OpenOptions, PathComponent},
     net::socket::write_sockaddr,
     prelude::*,
@@ -15,7 +16,7 @@ impl<'a> SyscallHandler<'a> {
         socklen: Option<UserVAddr>,
     ) -> Result<isize> {
         let opened_file = current_process().get_opened_file_by_fd(fd)?;
-        let (sock, accepted_sockaddr) = opened_file.lock().accept()?;
+        let (sock, accepted_sockaddr) = opened_file.accept()?;
 
         let options = OpenOptions {
             nonblock: false,

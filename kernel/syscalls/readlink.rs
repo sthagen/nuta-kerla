@@ -1,7 +1,8 @@
+use kerla_runtime::address::UserVAddr;
+
 use crate::result::Result;
 use crate::syscalls::SyscallHandler;
 use crate::{
-    arch::UserVAddr,
     fs::{opened_file::Fd, path::Path},
     process::current_process,
     result::Errno,
@@ -18,7 +19,6 @@ impl<'a> SyscallHandler<'a> {
                 .opened_files()
                 .lock()
                 .get(Fd::new(fd))?
-                .lock()
                 .path()
                 .resolve_absolute_path()
         } else {

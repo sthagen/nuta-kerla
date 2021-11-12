@@ -1,8 +1,10 @@
 #![cfg(test)]
+#![allow(clippy::print_with_newline)]
 
-use crate::arch::*;
 use core::panic::PanicInfo;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::Ordering;
+
+use kerla_runtime::arch::{semihosting_halt, SemihostingExitStatus};
 
 pub trait Testable {
     fn run(&self);
@@ -25,28 +27,27 @@ pub fn run_tests(tests: &[&dyn Testable]) {
         test.run();
     }
     print!("\n");
-    println!("\x1b[92mPassed all tests :)\x1b[0m\n");
+    print!("\x1b[92mPassed all tests :)\x1b[0m\n");
 }
 
 pub fn end_tests() -> ! {
-    semihosting_halt(ExitStatus::Success);
+    semihosting_halt(SemihostingExitStatus::Success);
 
     #[allow(clippy::empty_loop)]
     loop {}
 }
 
-static ALREADY_PANICED: AtomicBool = AtomicBool::new(false);
-
 #[cfg(test)]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    if ALREADY_PANICED.load(Ordering::SeqCst) {
+    use crate::lang_items::PANICKED;
+
+    if PANICKED.load(Ordering::SeqCst) {
         loop {}
     }
 
-    ALREADY_PANICED.store(true, Ordering::SeqCst);
-
-    print!("\x1b[1;91mfail\x1b[0m\n{}\n", info);
-    semihosting_halt(ExitStatus::Failure);
+    PANICKED.store(true, Ordering::SeqCst);
+    print!("\x1b[1;91mfail\npanic: {}\x1b[0m", info);
+    semihosting_halt(SemihostingExitStatus::Failure);
     loop {}
 }
