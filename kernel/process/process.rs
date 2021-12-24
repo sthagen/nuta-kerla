@@ -1,5 +1,5 @@
 use crate::{
-    arch::{self, KERNEL_STACK_SIZE, USER_STACK_TOP},
+    arch::{self, USER_STACK_TOP},
     ctypes::*,
     fs::{
         devfs::SERIAL_TTY,
@@ -15,33 +15,47 @@ use crate::{
         elf::{Elf, ProgramHeader},
         init_stack::{estimate_user_init_stack_size, init_user_stack, Auxv},
         process_group::{PgId, ProcessGroup},
-        signal::{SigAction, Signal, SignalDelivery, SIGCHLD, SIGKILL},
+        signal::{SigAction, SigSet, Signal, SignalDelivery, SignalMask, SIGCHLD, SIGKILL},
         switch, UserVAddr, JOIN_WAIT_QUEUE, SCHEDULER,
     },
     random::read_secure_random,
+    result::Errno,
     INITIAL_ROOT_FS,
 };
-
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use atomic_refcell::{AtomicRef, AtomicRefCell};
-use core::cmp::max;
 use core::mem::size_of;
 use core::sync::atomic::{AtomicI32, Ordering};
+use core::{cmp::max, sync::atomic::AtomicUsize};
 use crossbeam::atomic::AtomicCell;
 use goblin::elf64::program_header::PT_LOAD;
 use kerla_runtime::{
-    arch::{SyscallFrame, PAGE_SIZE},
+    arch::{PtRegs, PAGE_SIZE},
     page_allocator::{alloc_pages, AllocPageFlags},
     spinlock::{SpinLock, SpinLockGuard},
 };
-use kerla_utils::alignment::align_up;
+use kerla_utils::{alignment::align_up, bitmap::BitMap};
 
 type ProcessTable = BTreeMap<PId, Arc<Process>>;
 
 /// The process table. All processes are registered in with its process Id.
 pub(super) static PROCESSES: SpinLock<ProcessTable> = SpinLock::new(BTreeMap::new());
+pub(super) static EXITED_PROCESSES: SpinLock<Vec<Arc<Process>>> = SpinLock::new(Vec::new());
+
+static FORK_TOTAL: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Debug)]
+pub struct Stats {
+    pub fork_total: usize,
+}
+
+pub fn read_process_stats() -> Stats {
+    Stats {
+        fork_total: FORK_TOTAL.load(Ordering::SeqCst),
+    }
+}
 
 /// Returns an unused PID. Note that this function does not reserve the PID:
 /// keep the process table locked until you insert the process into the table!
@@ -93,6 +107,7 @@ pub enum ProcessState {
 /// The process control block.
 pub struct Process {
     arch: arch::Process,
+    is_idle: bool,
     process_group: AtomicRefCell<Weak<SpinLock<ProcessGroup>>>,
     pid: PId,
     state: AtomicCell<ProcessState>,
@@ -103,7 +118,8 @@ pub struct Process {
     opened_files: SpinLock<OpenedFileTable>,
     root_fs: Arc<SpinLock<RootFs>>,
     signals: SpinLock<SignalDelivery>,
-    signaled_frame: AtomicCell<Option<SyscallFrame>>,
+    signaled_frame: AtomicCell<Option<PtRegs>>,
+    sigset: SpinLock<SigSet>,
 }
 
 impl Process {
@@ -114,6 +130,7 @@ impl Process {
     pub fn new_idle_thread() -> Result<Arc<Process>> {
         let process_group = ProcessGroup::new(PgId::new(0));
         let proc = Arc::new(Process {
+            is_idle: true,
             process_group: AtomicRefCell::new(Arc::downgrade(&process_group)),
             arch: arch::Process::new_idle_thread(),
             state: AtomicCell::new(ProcessState::Runnable),
@@ -126,6 +143,7 @@ impl Process {
             opened_files: SpinLock::new(OpenedFileTable::new()),
             signals: SpinLock::new(SignalDelivery::new()),
             signaled_frame: AtomicCell::new(None),
+            sigset: SpinLock::new(BitMap::zeroed()),
         });
 
         process_group.lock().add(Arc::downgrade(&proc));
@@ -171,22 +189,22 @@ impl Process {
 
         let entry = setup_userspace(executable_path, argv, &[], &root_fs)?;
         let pid = PId::new(1);
-        let stack_bottom = alloc_pages(KERNEL_STACK_SIZE / PAGE_SIZE, AllocPageFlags::KERNEL)?;
-        let kernel_sp = stack_bottom.as_vaddr().add(KERNEL_STACK_SIZE);
         let process_group = ProcessGroup::new(PgId::new(1));
         let process = Arc::new(Process {
+            is_idle: false,
             process_group: AtomicRefCell::new(Arc::downgrade(&process_group)),
             pid,
             parent: Weak::new(),
             children: SpinLock::new(Vec::new()),
             state: AtomicCell::new(ProcessState::Runnable),
             cmdline: AtomicRefCell::new(Cmdline::from_argv(argv)),
-            arch: arch::Process::new_user_thread(entry.ip, entry.user_sp, kernel_sp),
+            arch: arch::Process::new_user_thread(entry.ip, entry.user_sp),
             vm: AtomicRefCell::new(Some(Arc::new(SpinLock::new(entry.vm)))),
             opened_files: SpinLock::new(opened_files),
             root_fs,
             signals: SpinLock::new(SignalDelivery::new()),
             signaled_frame: AtomicCell::new(None),
+            sigset: SpinLock::new(BitMap::zeroed()),
         });
 
         process_group.lock().add(Arc::downgrade(&process));
@@ -202,8 +220,20 @@ impl Process {
         PROCESSES.lock().get(&pid).cloned()
     }
 
+    /// Returns true if the process is a idle kernel thread.
+    pub fn is_idle(&self) -> bool {
+        self.is_idle
+    }
+
     /// The process ID.
     pub fn pid(&self) -> PId {
+        self.pid
+    }
+
+    /// The thread ID.
+    pub fn tid(&self) -> PId {
+        // In a single-threaded process, the thread ID is equal to the process ID (PID).
+        // https://man7.org/linux/man-pages/man2/gettid.2.html
         self.pid
     }
 
@@ -314,7 +344,17 @@ impl Process {
 
         current.set_state(ProcessState::ExitedWith(status));
         if let Some(parent) = current.parent.upgrade() {
-            parent.send_signal(SIGCHLD);
+            if parent.signals().lock().get_action(SIGCHLD) == SigAction::Ignore {
+                // If the parent process is not waiting for a child,
+                // remove the child from its list.
+                parent.children().retain(|p| p.pid() != current.pid);
+
+                // Keep the reference because we're using its kernel stack. Postpone
+                // freeing the stack until we move from the current thread.
+                EXITED_PROCESSES.lock().push(current.clone());
+            } else {
+                parent.send_signal(SIGCHLD)
+            }
         }
 
         // Close opened files here instead of in Drop::drop because `proc` is
@@ -326,6 +366,12 @@ impl Process {
         JOIN_WAIT_QUEUE.wake_all();
         switch();
         unreachable!();
+    }
+
+    /// Terminates the **current** thread and other threads belonging to the same thread group.
+    pub fn exit_group(status: c_int) -> ! {
+        // TODO: Kill other threads belonging to the same thread group.
+        Process::exit(status)
     }
 
     /// Terminates the **current** process by a signal.
@@ -344,25 +390,53 @@ impl Process {
         self.signals.lock().is_pending()
     }
 
+    /// Sets signal mask.
+    pub fn set_signal_mask(
+        &self,
+        how: SignalMask,
+        set: Option<UserVAddr>,
+        oldset: Option<UserVAddr>,
+        _length: usize,
+    ) -> Result<()> {
+        let mut sigset = self.sigset.lock();
+
+        if let Some(old) = oldset {
+            old.write_bytes(sigset.as_slice())?;
+        }
+
+        if let Some(new) = set {
+            let new_set = new.read::<[u8; 128]>()?;
+            match how {
+                SignalMask::Block => sigset.assign_or(new_set),
+                SignalMask::Unblock => sigset.assign_and_not(new_set),
+                SignalMask::Set => sigset.assign(new_set),
+            }
+        }
+
+        Ok(())
+    }
+
     /// Tries to delivering a pending signal to the current process.
     ///
     /// If there's a pending signal, it may modify `frame` (e.g. user return
     /// address and stack pointer) to call the registered user's signal handler.
-    pub fn try_delivering_signal(frame: &mut SyscallFrame) -> Result<()> {
-        // TODO: sigmask
+    pub fn try_delivering_signal(frame: &mut PtRegs) -> Result<()> {
         let current = current_process();
         if let Some((signal, sigaction)) = current.signals.lock().pop_pending() {
-            match sigaction {
-                SigAction::Ignore => {}
-                SigAction::Terminate => {
-                    trace!("terminating {:?} by {:?}", current.pid, signal,);
-                    Process::exit(1 /* FIXME: */);
-                }
-                SigAction::Handler { handler } => {
-                    trace!("delivering {:?} to {:?}", signal, current.pid,);
-                    current.signaled_frame.store(Some(*frame));
-                    unsafe {
-                        current.arch.setup_signal_stack(frame, signal, handler)?;
+            let sigset = current.sigset.lock();
+            if !sigset.get(signal as usize).unwrap_or(true) {
+                match sigaction {
+                    SigAction::Ignore => {}
+                    SigAction::Terminate => {
+                        trace!("terminating {:?} by {:?}", current.pid, signal,);
+                        Process::exit(1 /* FIXME: */);
+                    }
+                    SigAction::Handler { handler } => {
+                        trace!("delivering {:?} to {:?}", signal, current.pid,);
+                        current.signaled_frame.store(Some(*frame));
+                        unsafe {
+                            current.arch.setup_signal_stack(frame, signal, handler)?;
+                        }
                     }
                 }
             }
@@ -373,7 +447,7 @@ impl Process {
 
     /// So-called `sigreturn`: restores the user context when the signal is
     /// delivered to a signal handler.
-    pub fn restore_signaled_user_stack(current: &Arc<Process>, current_frame: &mut SyscallFrame) {
+    pub fn restore_signaled_user_stack(current: &Arc<Process>, current_frame: &mut PtRegs) {
         if let Some(signaled_frame) = current.signaled_frame.swap(None) {
             current
                 .arch
@@ -392,7 +466,7 @@ impl Process {
     /// new stack (ie. argv and envp) when the system call handler returns into
     /// the userspace.
     pub fn execve(
-        frame: &mut SyscallFrame,
+        frame: &mut PtRegs,
         executable_path: Arc<PathComponent>,
         argv: &[&[u8]],
         envp: &[&[u8]],
@@ -418,7 +492,7 @@ impl Process {
 
     /// Creates a new process. The calling process (`self`) will be the parent
     /// process of the created process. Returns the created child process.
-    pub fn fork(parent: &Arc<Process>, parent_frame: &SyscallFrame) -> Result<Arc<Process>> {
+    pub fn fork(parent: &Arc<Process>, parent_frame: &PtRegs) -> Result<Arc<Process>> {
         let parent_weak = Arc::downgrade(parent);
         let mut process_table = PROCESSES.lock();
         let pid = alloc_pid(&mut process_table)?;
@@ -426,8 +500,10 @@ impl Process {
         let vm = parent.vm().as_ref().unwrap().lock().fork()?;
         let opened_files = parent.opened_files().lock().fork();
         let process_group = parent.process_group();
+        let sig_set = parent.sigset.lock();
 
         let child = Arc::new(Process {
+            is_idle: false,
             process_group: AtomicRefCell::new(Arc::downgrade(&process_group)),
             pid,
             state: AtomicCell::new(ProcessState::Runnable),
@@ -440,12 +516,15 @@ impl Process {
             arch,
             signals: SpinLock::new(SignalDelivery::new()),
             signaled_frame: AtomicCell::new(None),
+            sigset: SpinLock::new(sig_set.clone()),
         });
 
         process_group.lock().add(Arc::downgrade(&child));
         parent.children().push(child.clone());
         process_table.insert(pid, child.clone());
         SCHEDULER.lock().enqueue(pid);
+
+        FORK_TOTAL.fetch_add(1, Ordering::Relaxed);
         Ok(child)
     }
 }
@@ -604,4 +683,12 @@ fn do_setup_userspace(
     }
 
     Ok(UserspaceEntry { vm, ip, user_sp })
+}
+
+pub fn gc_exited_processes() {
+    if current_process().is_idle() {
+        // If we're in an idle thread, it's safe to free kernel stacks allocated
+        // for other exited processes.
+        EXITED_PROCESSES.lock().clear();
+    }
 }

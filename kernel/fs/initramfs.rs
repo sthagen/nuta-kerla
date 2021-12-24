@@ -6,7 +6,7 @@ use crate::{
         inode::{DirEntry, Directory, FileLike, FileType, INode, INodeNo},
         path::Path,
         stat::FileMode,
-        stat::{Stat, S_IFDIR},
+        stat::{FileSize, Stat, S_IFDIR},
     },
     prelude::*,
     user_buffer::{UserBufWriter, UserBuffer, UserBufferMut},
@@ -279,6 +279,7 @@ impl InitramFs {
                         stat: Stat {
                             inode_no: INodeNo::new(ino),
                             mode,
+                            size: FileSize(filesize as isize),
                             ..Stat::zeroed()
                         },
                     })),
@@ -320,6 +321,10 @@ impl FileSystem for InitramFs {
 pub fn init() {
     INITRAM_FS.init(|| {
         let image = include_bytes!(concat!("../../", env!("INITRAMFS_PATH")));
+        if image.is_empty() {
+            panic!("initramfs is not embedded");
+        }
+
         Arc::new(InitramFs::new(image))
     });
 }

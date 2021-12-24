@@ -1,5 +1,6 @@
 use crate::{ctypes::c_int, prelude::*};
 use kerla_runtime::address::UserVAddr;
+use kerla_utils::bitmap::BitMap;
 
 pub type Signal = c_int;
 #[allow(unused)]
@@ -70,7 +71,7 @@ const SIGMAX: c_int = 32;
 pub const SIG_DFL: usize = 0;
 pub const SIG_IGN: usize = 1;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 pub enum SigAction {
     Ignore,
     Terminate,
@@ -126,6 +127,10 @@ impl SignalDelivery {
         }
     }
 
+    pub fn get_action(&self, signal: Signal) -> SigAction {
+        self.actions[signal as usize]
+    }
+
     pub fn set_action(&mut self, signal: Signal, action: SigAction) -> Result<()> {
         if signal > SIGMAX {
             return Err(Errno::EINVAL.into());
@@ -152,4 +157,11 @@ impl SignalDelivery {
     pub fn signal(&mut self, signal: Signal) {
         self.pending |= 1 << (signal);
     }
+}
+
+pub type SigSet = BitMap<128 /* 1024 / 8 */>;
+pub enum SignalMask {
+    Block,
+    Unblock,
+    Set,
 }

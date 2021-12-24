@@ -1,11 +1,9 @@
-use kerla_runtime::arch::console_write;
-use kerla_runtime::print::{set_printer, Printer};
+use alloc::boxed::Box;
+use kerla_runtime::print::{get_debug_printer, set_debug_printer, Printer};
 use kerla_utils::ring_buffer::RingBuffer;
 
 use crate::lang_items::PANICKED;
 use core::sync::atomic::Ordering;
-
-pub struct LoggedPrinter;
 
 pub const KERNEL_LOG_BUF_SIZE: usize = 8192;
 // We use spin::Mutex here because SpinLock's debugging features may cause a
@@ -13,15 +11,32 @@ pub const KERNEL_LOG_BUF_SIZE: usize = 8192;
 pub static KERNEL_LOG_BUF: spin::Mutex<RingBuffer<u8, KERNEL_LOG_BUF_SIZE>> =
     spin::Mutex::new(RingBuffer::new());
 
+pub struct LoggedPrinter {
+    inner: &'static dyn Printer,
+}
+
+impl LoggedPrinter {
+    pub fn new(inner: &'static dyn Printer) -> LoggedPrinter {
+        LoggedPrinter { inner }
+    }
+}
+
 impl Printer for LoggedPrinter {
     fn print_bytes(&self, s: &[u8]) {
-        console_write(s);
+        self.inner.print_bytes(s);
 
-        // Don't write into the kernel log buffer as it may call a printk function
-        // due to an assertion.
-        if !PANICKED.load(Ordering::SeqCst) {
-            KERNEL_LOG_BUF.lock().push_slice(s);
+        if PANICKED.load(Ordering::SeqCst) {
+            // If kernel panics, it's uncertain whether KERNEL_LOG_BUF is in
+            // a dead lock.
+            //
+            // Since only single CPU can continue handling a panic, we can
+            // ensure it's safe to unlock it.
+            unsafe {
+                KERNEL_LOG_BUF.force_unlock();
+            }
         }
+
+        KERNEL_LOG_BUF.lock().push_slice(s);
     }
 }
 
@@ -70,5 +85,6 @@ macro_rules! warn_if_err {
 }
 
 pub fn init() {
-    set_printer(&LoggedPrinter);
+    let printer = Box::new(LoggedPrinter::new(get_debug_printer()));
+    set_debug_printer(Box::leak(printer));
 }

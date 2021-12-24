@@ -14,7 +14,7 @@ use crate::{
     user_buffer::UserCStr,
 };
 use bitflags::bitflags;
-use kerla_runtime::{address::UserVAddr, arch::SyscallFrame};
+use kerla_runtime::{address::UserVAddr, arch::PtRegs};
 
 pub(self) mod accept;
 pub(self) mod arch_prctl;
@@ -28,6 +28,7 @@ pub(self) mod connect;
 pub(self) mod dup2;
 pub(self) mod execve;
 pub(self) mod exit;
+pub(self) mod exit_group;
 pub(self) mod fcntl;
 pub(self) mod fork;
 pub(self) mod fstat;
@@ -41,6 +42,7 @@ pub(self) mod getppid;
 pub(self) mod getrandom;
 pub(self) mod getsockname;
 pub(self) mod getsockopt;
+pub(self) mod gettid;
 pub(self) mod ioctl;
 pub(self) mod link;
 pub(self) mod linkat;
@@ -56,11 +58,13 @@ pub(self) mod readlink;
 pub(self) mod reboot;
 pub(self) mod recvfrom;
 pub(self) mod rt_sigaction;
+pub(self) mod rt_sigprocmask;
 pub(self) mod rt_sigreturn;
 pub(self) mod select;
 pub(self) mod sendto;
 pub(self) mod set_tid_address;
 pub(self) mod setpgid;
+pub(self) mod shutdown;
 pub(self) mod socket;
 pub(self) mod stat;
 pub(self) mod syslog;
@@ -111,6 +115,7 @@ const SYS_POLL: usize = 7;
 const SYS_MMAP: usize = 9;
 const SYS_BRK: usize = 12;
 const SYS_RT_SIGACTION: usize = 13;
+const SYS_RT_SIGPROCMASK: usize = 14;
 const SYS_RT_SIGRETURN: usize = 15;
 const SYS_IOCTL: usize = 16;
 const SYS_WRITEV: usize = 20;
@@ -123,6 +128,7 @@ const SYS_CONNECT: usize = 42;
 const SYS_ACCEPT: usize = 43;
 const SYS_SENDTO: usize = 44;
 const SYS_RECVFROM: usize = 45;
+const SYS_SHUTDOWN: usize = 48;
 const SYS_BIND: usize = 49;
 const SYS_LISTEN: usize = 50;
 const SYS_GETSOCKNAME: usize = 51;
@@ -153,9 +159,11 @@ const SYS_GETPGID: usize = 121;
 const SYS_SETGROUPS: usize = 116;
 const SYS_ARCH_PRCTL: usize = 158;
 const SYS_REBOOT: usize = 169;
+const SYS_GETTID: usize = 186;
 const SYS_GETDENTS64: usize = 217;
 const SYS_SET_TID_ADDRESS: usize = 218;
 const SYS_CLOCK_GETTIME: usize = 228;
+const SYS_EXIT_GROUP: usize = 231;
 const SYS_UTIMES: usize = 235;
 const SYS_LINKAT: usize = 265;
 const SYS_GETRANDOM: usize = 318;
@@ -166,11 +174,11 @@ fn resolve_path(uaddr: usize) -> Result<PathBuf> {
 }
 
 pub struct SyscallHandler<'a> {
-    pub frame: &'a mut SyscallFrame,
+    pub frame: &'a mut PtRegs,
 }
 
 impl<'a> SyscallHandler<'a> {
-    pub fn new(frame: &'a mut SyscallFrame) -> SyscallHandler<'a> {
+    pub fn new(frame: &'a mut PtRegs) -> SyscallHandler<'a> {
         SyscallHandler { frame }
     }
 
@@ -312,8 +320,10 @@ impl<'a> SyscallHandler<'a> {
                 UserVAddr::new(a4),
             ),
             SYS_EXIT => self.sys_exit(a1 as i32),
+            SYS_EXIT_GROUP => self.sys_exit_group(a1 as i32),
             SYS_SOCKET => self.sys_socket(a1 as i32, a2 as i32, a3 as i32),
             SYS_BIND => self.sys_bind(Fd::new(a1 as i32), UserVAddr::new_nonnull(a2)?, a3 as usize),
+            SYS_SHUTDOWN => self.sys_shutdown(Fd::new(a1 as i32), a2 as i32),
             SYS_CONNECT => {
                 self.sys_connect(Fd::new(a1 as i32), UserVAddr::new_nonnull(a2)?, a3 as usize)
             }
@@ -365,6 +375,10 @@ impl<'a> SyscallHandler<'a> {
             ),
             SYS_SYSLOG => self.sys_syslog(a1 as c_int, UserVAddr::new(a2), a3 as c_int),
             SYS_REBOOT => self.sys_reboot(a1 as c_int, a2 as c_int, a3),
+            SYS_GETTID => self.sys_gettid(),
+            SYS_RT_SIGPROCMASK => {
+                self.sys_rt_sigprocmask(a1, UserVAddr::new(a2), UserVAddr::new(a3), a4)
+            }
             _ => {
                 debug_warn!(
                     "unimplemented system call: {} (n={})",

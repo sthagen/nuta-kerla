@@ -7,6 +7,7 @@ on:
 jobs:
   build_and_test:
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -36,13 +37,18 @@ jobs:
         with:
           python-version: 3.9
 
-      - name: Set up Rust
+      - name: Show toolchain versions
         run: |
-          rustup override set nightly
-          rustup component add llvm-tools-preview rust-src clippy
+          rustup show
+          rustup --version
+          rustc --version
+          cargo --version
 
       - name: Install cargo crates
         run: cargo install cargo-binutils rustfilt
+
+      - name: make check
+        run: make check
 
       - name: Build Kerla
         run: make ${{ matrix.build_options }}

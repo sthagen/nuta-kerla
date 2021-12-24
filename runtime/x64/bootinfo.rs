@@ -1,8 +1,9 @@
 use crate::address::{PAddr, VAddr};
-use crate::bootinfo::{BootInfo, RamArea, VirtioMmioDevice};
-use arrayvec::ArrayVec;
+use crate::bootinfo::{AllowedPciDevice, BootInfo, RamArea, VirtioMmioDevice};
+use arrayvec::{ArrayString, ArrayVec};
 use core::cmp::max;
 use core::mem::size_of;
+use core::slice;
 use kerla_utils::alignment::align_up;
 use kerla_utils::byte_size::ByteSize;
 
@@ -126,6 +127,12 @@ extern "C" {
 struct Cmdline {
     pub pci_enabled: bool,
     pub virtio_mmio_devices: ArrayVec<VirtioMmioDevice, 4>,
+    pub log_filter: ArrayString<64>,
+    pub use_second_serialport: bool,
+    pub dhcp_enabled: bool,
+    pub ip4: Option<ArrayString<18>>,
+    pub gateway_ip4: Option<ArrayString<15>>,
+    pub pci_allowlist: ArrayVec<AllowedPciDevice, 4>,
 }
 
 impl Cmdline {
@@ -134,14 +141,47 @@ impl Cmdline {
         info!("cmdline: {}", if s.is_empty() { "(empty)" } else { s });
 
         let mut pci_enabled = true;
+        let mut pci_allowlist = ArrayVec::new();
         let mut virtio_mmio_devices = ArrayVec::new();
+        let mut log_filter = ArrayString::new();
+        let mut use_second_serialport = false;
+        let mut dhcp_enabled = true;
+        let mut ip4 = None;
+        let mut gateway_ip4 = None;
         if !s.is_empty() {
             for config in s.split(' ') {
+                if config.is_empty() {
+                    continue;
+                }
+
                 let mut words = config.splitn(2, '=');
                 match (words.next(), words.next()) {
                     (Some("pci"), Some("off")) => {
                         warn!("bootinfo: PCI disabled");
                         pci_enabled = false;
+                    }
+                    (Some("pci_device"), Some(bus_and_slot)) => {
+                        warn!("bootinfo: allowed PCI device: {}", bus_and_slot);
+                        let mut iter = bus_and_slot.splitn(2, ':');
+                        let bus = iter
+                            .next()
+                            .and_then(|w| w.parse().ok())
+                            .expect("bootinfo.bus_and_slot must be formed as bus:slot");
+                        let slot = iter
+                            .next()
+                            .and_then(|w| w.parse().ok())
+                            .expect("bootinfo.bus_and_slot must be formed as bus:slot");
+                        pci_allowlist.push(AllowedPciDevice { bus, slot });
+                    }
+                    (Some("serial1"), Some("on")) => {
+                        info!("bootinfo: secondary serial port enabled");
+                        use_second_serialport = true;
+                    }
+                    (Some("log"), Some(value)) => {
+                        info!("bootinfo: log filter = \"{}\"", value);
+                        if log_filter.try_push_str(value).is_err() {
+                            warn!("bootinfo: log filter is too long");
+                        }
                     }
                     (Some("virtio_mmio.device"), Some(value)) => {
                         let mut size_and_rest = value.splitn(2, "@0x");
@@ -161,6 +201,27 @@ impl Cmdline {
                             irq,
                         })
                     }
+                    (Some("dhcp"), Some("off")) => {
+                        warn!("bootinfo: DHCP disabled");
+                        dhcp_enabled = false;
+                    }
+                    (Some("ip4"), Some(value)) => {
+                        let mut s = ArrayString::new();
+                        if s.try_push_str(value).is_err() {
+                            warn!("bootinfo: ip4 is too long");
+                        }
+                        ip4 = Some(s);
+                    }
+                    (Some("gateway_ip4"), Some(value)) => {
+                        let mut s = ArrayString::new();
+                        if s.try_push_str(value).is_err() {
+                            warn!("bootinfo: gateway_ip4 is too long");
+                        }
+                        gateway_ip4 = Some(s);
+                    }
+                    (Some(path), None) if path.starts_with('/') => {
+                        // QEMU appends a kernel image path. Just ignore it.
+                    }
                     _ => {
                         warn!("cmdline: unsupported option, ignoring: '{}'", config);
                     }
@@ -170,7 +231,13 @@ impl Cmdline {
 
         Cmdline {
             pci_enabled,
+            pci_allowlist,
             virtio_mmio_devices,
+            log_filter,
+            use_second_serialport,
+            dhcp_enabled,
+            ip4,
+            gateway_ip4,
         }
     }
 }
@@ -215,26 +282,47 @@ unsafe fn parse_multiboot2_info(header: &Multiboot2InfoHeader) -> BootInfo {
     let header_vaddr = VAddr::new(header as *const _ as usize);
     let mut off = size_of::<Multiboot2TagHeader>();
     let mut ram_areas = ArrayVec::new();
+    let mut cmdline = None;
     while off + size_of::<Multiboot2TagHeader>() < header.total_size as usize {
         let tag_vaddr = header_vaddr.add(off);
         let tag = &*tag_vaddr.as_ptr::<Multiboot2TagHeader>();
-        if tag.tag_type == 6 {
-            // Memory map.
-            let tag = &*(tag as *const Multiboot2TagHeader as *const Multiboot2MemoryMapTag);
-            let mut entry_off = size_of::<Multiboot2MemoryMapTag>();
-            while entry_off < tag.tag_size as usize {
-                let entry = &*tag_vaddr
-                    .add(entry_off)
-                    .as_ptr::<Multiboot2MemoryMapEntry>();
+        match tag.tag_type {
+            1 => {
+                // Command line.
+                let cstr = tag_vaddr
+                    .add(size_of::<Multiboot2TagHeader>())
+                    .as_ptr::<u8>();
+                let mut len = 0;
+                while cstr.add(len).read() != 0 {
+                    len += 1;
+                }
 
-                process_memory_map_entry(
-                    &mut ram_areas,
-                    entry.entry_type,
-                    entry.base as usize,
-                    entry.len as usize,
+                cmdline = Some(
+                    core::str::from_utf8(slice::from_raw_parts(cstr, len))
+                        .expect("cmdline is not a utf-8 string"),
                 );
+            }
+            6 => {
+                // Memory map.
+                let tag = &*(tag as *const Multiboot2TagHeader as *const Multiboot2MemoryMapTag);
+                let mut entry_off = size_of::<Multiboot2MemoryMapTag>();
+                while entry_off < tag.tag_size as usize {
+                    let entry = &*tag_vaddr
+                        .add(entry_off)
+                        .as_ptr::<Multiboot2MemoryMapEntry>();
 
-                entry_off += tag.entry_size as usize;
+                    process_memory_map_entry(
+                        &mut ram_areas,
+                        entry.entry_type,
+                        entry.base as usize,
+                        entry.len as usize,
+                    );
+
+                    entry_off += tag.entry_size as usize;
+                }
+            }
+            _ => {
+                // Unsupported tag. Ignored .
             }
         }
 
@@ -242,11 +330,17 @@ unsafe fn parse_multiboot2_info(header: &Multiboot2InfoHeader) -> BootInfo {
     }
 
     assert!(!ram_areas.is_empty());
-    let cmdline = Cmdline::parse(b"" /* TODO: */);
+    let cmdline = Cmdline::parse(cmdline.unwrap_or("").as_bytes());
     BootInfo {
         ram_areas,
         pci_enabled: cmdline.pci_enabled,
+        pci_allowlist: cmdline.pci_allowlist,
         virtio_mmio_devices: cmdline.virtio_mmio_devices,
+        log_filter: cmdline.log_filter,
+        use_second_serialport: cmdline.use_second_serialport,
+        dhcp_enabled: cmdline.dhcp_enabled,
+        ip4: cmdline.ip4,
+        gateway_ip4: cmdline.gateway_ip4,
     }
 }
 
@@ -265,11 +359,33 @@ unsafe fn parse_multiboot_legacy_info(info: &MultibootLegacyInfo) -> BootInfo {
         off += entry.entry_size + size_of::<u32>() as u32;
     }
 
-    let cmdline = Cmdline::parse(b"" /* TODO: */);
+    let mut cmdline = None;
+    if info.cmdline != 0 {
+        // Command line.
+        let cstr = PAddr::new(info.cmdline as usize).as_ptr::<u8>();
+        let mut len = 0;
+        while cstr.add(len).read() != 0 {
+            len += 1;
+        }
+
+        cmdline = Some(
+            core::str::from_utf8(slice::from_raw_parts(cstr, len))
+                .expect("cmdline is not a utf-8 string"),
+        );
+        trace!("cmdline={:?}", cmdline);
+    }
+
+    let cmdline = Cmdline::parse(cmdline.unwrap_or("").as_bytes());
     BootInfo {
         ram_areas,
         pci_enabled: cmdline.pci_enabled,
+        pci_allowlist: cmdline.pci_allowlist,
         virtio_mmio_devices: cmdline.virtio_mmio_devices,
+        log_filter: cmdline.log_filter,
+        use_second_serialport: cmdline.use_second_serialport,
+        dhcp_enabled: cmdline.dhcp_enabled,
+        ip4: cmdline.ip4,
+        gateway_ip4: cmdline.gateway_ip4,
     }
 }
 
@@ -298,7 +414,13 @@ unsafe fn parse_linux_boot_params(boot_params: PAddr) -> BootInfo {
     BootInfo {
         ram_areas,
         pci_enabled: cmdline.pci_enabled,
+        pci_allowlist: cmdline.pci_allowlist,
         virtio_mmio_devices: cmdline.virtio_mmio_devices,
+        log_filter: cmdline.log_filter,
+        use_second_serialport: cmdline.use_second_serialport,
+        dhcp_enabled: cmdline.dhcp_enabled,
+        ip4: cmdline.ip4,
+        gateway_ip4: cmdline.gateway_ip4,
     }
 }
 
