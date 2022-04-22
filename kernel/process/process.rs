@@ -36,7 +36,7 @@ use kerla_runtime::{
     page_allocator::{alloc_pages, AllocPageFlags},
     spinlock::{SpinLock, SpinLockGuard},
 };
-use kerla_utils::{alignment::align_up, bitmap::BitMap};
+use kerla_utils::{alignment::align_up};
 
 type ProcessTable = BTreeMap<PId, Arc<Process>>;
 
@@ -115,9 +115,9 @@ pub struct Process {
     cmdline: AtomicRefCell<Cmdline>,
     children: SpinLock<Vec<Arc<Process>>>,
     vm: AtomicRefCell<Option<Arc<SpinLock<Vm>>>>,
-    opened_files: SpinLock<OpenedFileTable>,
+    opened_files: Arc<SpinLock<OpenedFileTable>>,
     root_fs: Arc<SpinLock<RootFs>>,
-    signals: SpinLock<SignalDelivery>,
+    signals: Arc<SpinLock<SignalDelivery>>,
     signaled_frame: AtomicCell<Option<PtRegs>>,
     sigset: SpinLock<SigSet>,
 }
@@ -140,10 +140,10 @@ impl Process {
             vm: AtomicRefCell::new(None),
             pid: PId::new(0),
             root_fs: INITIAL_ROOT_FS.clone(),
-            opened_files: SpinLock::new(OpenedFileTable::new()),
-            signals: SpinLock::new(SignalDelivery::new()),
+            opened_files: Arc::new(SpinLock::new(OpenedFileTable::new())),
+            signals: Arc::new(SpinLock::new(SignalDelivery::new())),
             signaled_frame: AtomicCell::new(None),
-            sigset: SpinLock::new(BitMap::zeroed()),
+            sigset: SpinLock::new(SigSet::ZERO),
         });
 
         process_group.lock().add(Arc::downgrade(&proc));
@@ -200,11 +200,11 @@ impl Process {
             cmdline: AtomicRefCell::new(Cmdline::from_argv(argv)),
             arch: arch::Process::new_user_thread(entry.ip, entry.user_sp),
             vm: AtomicRefCell::new(Some(Arc::new(SpinLock::new(entry.vm)))),
-            opened_files: SpinLock::new(opened_files),
+            opened_files: Arc::new(SpinLock::new(opened_files)),
             root_fs,
-            signals: SpinLock::new(SignalDelivery::new()),
+            signals: Arc::new(SpinLock::new(SignalDelivery::new())),
             signaled_frame: AtomicCell::new(None),
-            sigset: SpinLock::new(BitMap::zeroed()),
+            sigset: SpinLock::new(SigSet::ZERO),
         });
 
         process_group.lock().add(Arc::downgrade(&process));
@@ -271,7 +271,7 @@ impl Process {
     }
 
     /// The ppened files table.
-    pub fn opened_files(&self) -> &SpinLock<OpenedFileTable> {
+    pub fn opened_files(&self) -> &Arc<SpinLock<OpenedFileTable>> {
         &self.opened_files
     }
 
@@ -401,15 +401,16 @@ impl Process {
         let mut sigset = self.sigset.lock();
 
         if let Some(old) = oldset {
-            old.write_bytes(sigset.as_slice())?;
+            old.write_bytes(sigset.as_raw_slice())?;
         }
 
         if let Some(new) = set {
             let new_set = new.read::<[u8; 128]>()?;
+            let new_set = SigSet::new(new_set);
             match how {
-                SignalMask::Block => sigset.assign_or(new_set),
-                SignalMask::Unblock => sigset.assign_and_not(new_set),
-                SignalMask::Set => sigset.assign(new_set),
+                SignalMask::Block => *sigset |= new_set,
+                SignalMask::Unblock => *sigset &= !new_set,
+                SignalMask::Set => *sigset = new_set,
             }
         }
 
@@ -424,7 +425,7 @@ impl Process {
         let current = current_process();
         if let Some((signal, sigaction)) = current.signals.lock().pop_pending() {
             let sigset = current.sigset.lock();
-            if !sigset.get(signal as usize).unwrap_or(true) {
+            if !sigset.get(signal as usize).as_deref().unwrap_or(&true) {
                 match sigaction {
                     SigAction::Ignore => {}
                     SigAction::Terminate => {
@@ -498,7 +499,7 @@ impl Process {
         let pid = alloc_pid(&mut process_table)?;
         let arch = parent.arch.fork(parent_frame)?;
         let vm = parent.vm().as_ref().unwrap().lock().fork()?;
-        let opened_files = parent.opened_files().lock().fork();
+        let opened_files = parent.opened_files().lock().clone(); // TODO: #88 has to address this
         let process_group = parent.process_group();
         let sig_set = parent.sigset.lock();
 
@@ -511,12 +512,12 @@ impl Process {
             cmdline: AtomicRefCell::new(parent.cmdline().clone()),
             children: SpinLock::new(Vec::new()),
             vm: AtomicRefCell::new(Some(Arc::new(SpinLock::new(vm)))),
-            opened_files: SpinLock::new(opened_files),
+            opened_files: Arc::new(SpinLock::new(opened_files)),
             root_fs: parent.root_fs().clone(),
             arch,
-            signals: SpinLock::new(SignalDelivery::new()),
+            signals: Arc::new(SpinLock::new(SignalDelivery::new())), // TODO: #88 has to address this
             signaled_frame: AtomicCell::new(None),
-            sigset: SpinLock::new(sig_set.clone()),
+            sigset: SpinLock::new(*sig_set),
         });
 
         process_group.lock().add(Arc::downgrade(&child));
